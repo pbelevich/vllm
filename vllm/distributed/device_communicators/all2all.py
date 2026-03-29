@@ -254,13 +254,14 @@ class DeepEPAll2AllManagerBase(All2AllManagerBase):
     All2All communication based on DeepEP High-Throughput kernels.
     """
 
-    def __init__(self, cpu_group, tcp_store_group=None):
+    def __init__(self, cpu_group, tcp_store_group=None, device_group=None):
         assert has_deep_ep(), (
             "DeepEP kernels not found. Please follow https://github.com/vllm-project/vllm/blob/main/tools/ep_kernels/README.md"
             " to install DeepEP kernels."
         )  # noqa
         super().__init__(cpu_group, tcp_store_group)
         self.handle_cache = Cache()
+        self.device_group = device_group
 
         # This is the DeepEP default. Stick to it till we can establish
         # reasonable defaults based on profiling.
@@ -308,8 +309,8 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
     All2All communication based on DeepEP High-Throughput kernels.
     """
 
-    def __init__(self, cpu_group, tcp_store_group=None):
-        super().__init__(cpu_group, tcp_store_group)
+    def __init__(self, cpu_group, tcp_store_group=None, device_group=None):
+        super().__init__(cpu_group, tcp_store_group, device_group=device_group)
 
     def _make_all2all_kwargs(self) -> dict[Any, Any]:
         # Defaults for internode and intranode are taken from DeepEP tests.
@@ -329,7 +330,7 @@ class DeepEPHTAll2AllManager(DeepEPAll2AllManagerBase):
         # TODO: remove platform-specific logic
         # once ROCm DeepEP is updated with the latest APIs.
         kwargs = dict(
-            group=self.cpu_group,
+            group=self.device_group if self.device_group is not None else self.cpu_group,
             num_nvl_bytes=num_nvl_bytes,
             num_rdma_bytes=num_rdma_bytes,
             low_latency_mode=False,
@@ -372,8 +373,8 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
     All2All communication based on DeepEP Low-Latency kernels.
     """
 
-    def __init__(self, cpu_group, tcp_store_group=None):
-        super().__init__(cpu_group, tcp_store_group)
+    def __init__(self, cpu_group, tcp_store_group=None, device_group=None):
+        super().__init__(cpu_group, tcp_store_group, device_group=device_group)
 
     def _make_all2all_kwargs(
         self,
@@ -407,7 +408,7 @@ class DeepEPLLAll2AllManager(DeepEPAll2AllManagerBase):
         # TODO: remove platform-specific logic
         # once ROCm DeepEP is updated with the latest APIs.
         kwargs = dict(
-            group=self.cpu_group,
+            group=self.device_group if self.device_group is not None else self.cpu_group,
             num_nvl_bytes=num_nvl_bytes,
             num_rdma_bytes=num_rdma_bytes,
             low_latency_mode=True,
