@@ -173,11 +173,12 @@ class DeepEPLLPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             )
             if block_k == DEEPEP_QUANT_BLOCK_SIZE:
                 # DeepEP kernels did the quantization for us.
-                x, x_scales = x
+                # Handle both 2-tuple (x, scales) and 3+ tuple from hybrid-ep.
+                x, x_scales = x[0], x[1]
                 return x, x_scales
 
             # Dequant to get back the tokens in the datatype we dispatched in.
-            x_fp8, x_scales = x
+            x_fp8, x_scales = x[0], x[1]
             x = dequant_fp8(x_fp8, x_scales).to(dtype=a1_dtype)
 
         assert isinstance(x, (torch.Tensor, tuple))
