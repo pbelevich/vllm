@@ -1,8 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+DeepEP High-Throughput noop implementation.
+
+This replaces the actual DeepEP dispatch/combine communication with no-ops
+that return correctly shaped tensors.  Useful for benchmarking the compute
+portion of MoE without any inter-rank data movement.
+"""
 from collections.abc import Callable
 
-import deep_ep
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -13,42 +19,55 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.math_utils import round_up
-from vllm.v1.worker.ubatching import (
-    dbo_current_ubatch_id,
-    dbo_enabled,
-    dbo_get_previous_event,
-    dbo_switch_to_comm,
-    dbo_switch_to_compute,
-    dbo_switch_to_compute_sync,
-    dbo_yield_and_switch_from_comm_to_compute,
-    dbo_yield_and_switch_from_compute_to_comm,
-)
+
+
+# ---------------------------------------------------------------------------
+# Lightweight stand-ins for deep_ep types so the rest of the code can
+# reference them without importing the real package.
+# ---------------------------------------------------------------------------
+class _NoopEventOverlap:
+    """Mimics deep_ep.EventOverlap with no actual event."""
+
+    def __init__(self):
+        self.event = None
+
+    def current_stream_wait(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+
+class _NoopBuffer:
+    """Mimics the subset of deep_ep.Buffer used by the HT prepare/finalize."""
+
+    def capture(self, *args, **kwargs):
+        return _NoopEventOverlap()
 
 
 class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     """
-    Prepare/Finalize using DeepEP High-Throughput kernels.
+    Prepare/Finalize using DeepEP High-Throughput kernels — **noop variant**.
+
+    dispatch() and combine() are replaced with identity operations that
+    return tensors of the correct shape/dtype without any communication.
     """
 
     @staticmethod
     def maybe_roundup_layer_hidden_size(hidden_size: int, dtype: torch.dtype) -> int:
-        # Round up hidden size so it is compatible with DeepEP High Throughput
-        # kernels.
-        # DeepEP intranode kernels make copies in units of,
-        # 32(warp-size) int4 elements. Round up hidden size to respect this.
-        # For example, an input hidden size of 2880 with dtype torch.bfloat16
-        # will be rounded up to 3072.
         hidden_size_bytes = hidden_size * dtype.itemsize
         xfer_atom_size = 512  # 32 * 16 (size(int4))
         if hidden_size_bytes % xfer_atom_size == 0:
             return hidden_size
-
         hidden_size_bytes = round_up(hidden_size_bytes, xfer_atom_size)
         return hidden_size_bytes // dtype.itemsize
 
     def __init__(
         self,
-        buffer: deep_ep.Buffer,
+        buffer,  # accepts real deep_ep.Buffer or _NoopBuffer
         num_dispatchers: int,
         dp_size: int,
         rank_expert_offset: int,
@@ -59,13 +78,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.dp_size = dp_size
         self.rank_expert_offset = rank_expert_offset
         self.async_prepare = True
-
-        # The dispatch function returns a handle that the combine function
-        # requires. Under DBO microbatching we must track one handle per
-        # micro-batch to avoid races between threads.
-        self.handles = [None, None]
-
-        # From https://github.com/deepseek-ai/DeepEP/blob/9fe9021f29c9083cd1808ab36b740208524d9f63/deep_ep/buffer.py#L164
+        self.handles: list[tuple | None] = [None, None]
         self.available_rank_configs = [2, 4, 8, 16, 24, 32, 64, 128, 144, 160]
 
     def num_dispatchers(self) -> int:
@@ -84,16 +97,9 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     def topk_indices_dtype(self) -> torch.dtype | None:
         return torch.int64
 
-    def _get_dispatch_config(self) -> deep_ep.Config | None:
-        if self.num_dispatchers_ not in self.available_rank_configs:
-            return None
-        return deep_ep.Buffer.get_dispatch_config(self.num_dispatchers_)
-
-    def _get_combine_config(self) -> deep_ep.Config | None:
-        if self.num_dispatchers_ not in self.available_rank_configs:
-            return None
-        return deep_ep.Buffer.get_combine_config(self.num_dispatchers_)
-
+    # ------------------------------------------------------------------
+    # Noop dispatch — returns input data with correct shapes, no comms
+    # ------------------------------------------------------------------
     def _do_dispatch(
         self,
         tokens: torch.Tensor,
@@ -105,69 +111,65 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
     ) -> Callable:
-        has_scales = token_scales is not None
+        num_tokens = tokens.size(0)
+        hidden = tokens.size(1)
+        num_topk = rank_topk_ids.size(1)
+        num_local_experts = num_experts // self.dp_size
 
-        # We yield before launching the dispatch kernel since the dispatch
-        # kernel will block the CPU so we want to queue up all the compute
-        # for the other ubatch before the dispatch kernel starts.
-        dbo_yield_and_switch_from_compute_to_comm()
-
-        # capture a DeepEP event and pass it as previous_event so
-        # DeepEP honors the dependency internally.
-        previous_event = dbo_get_previous_event(self.buffer.capture)
-
-        (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            dispatch_expert_num_tokens,
-            is_token_in_rank,
-            event,
-        ) = self.buffer.get_dispatch_layout(
-            topk_idx=rank_topk_ids,
-            num_experts=num_experts,
-            previous_event=previous_event,
-            async_finish=False,
-            allocate_on_comm_stream=False,
+        # ----- Simulate get_dispatch_layout -----
+        # In a real run every token goes to num_topk experts.  For the noop
+        # we pretend all tokens stay local.
+        num_tokens_per_rank = torch.zeros(
+            self.num_dispatchers_, dtype=torch.int32, device=tokens.device
         )
+        # Put all tokens on rank-0 (self) so the rest of the logic still works.
+        num_tokens_per_rank[0] = num_tokens
 
-        token_data = tokens
-        if has_scales:
-            token_data = (tokens, token_scales)
+        # ----- Simulate dispatch -----
+        # The real dispatch scatters tokens across ranks and returns the
+        # received slice.  In the noop we just pass the input through.
+        #
+        # recv_x shape: [total_recv_tokens, hidden]
+        # Since we pretend everything stays local, total_recv = num_tokens.
+        recv_x = tokens  # [num_tokens, hidden]
+        recv_x_scales = token_scales  # may be None
 
-        (
-            token_data,
-            expert_topk_ids,
-            expert_topk_weights,
-            expert_num_tokens_per_expert_list,
-            handle,
-            event,
-        ) = self.buffer.dispatch(
-            x=token_data,
-            handle=None,
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            is_token_in_rank=is_token_in_rank,
-            num_tokens_per_expert=dispatch_expert_num_tokens,
-            topk_idx=rank_topk_ids,
-            topk_weights=rank_topk_weights,
-            # expert_alignment rounds the number of tokens per expert
-            # to this value.
-            expert_alignment=1,
-            config=self._get_dispatch_config(),
-            previous_event=previous_event,
-            async_finish=self.async_prepare and not dbo_enabled(),
-            allocate_on_comm_stream=False,
-        )
+        if recv_x_scales is not None:
+            token_data = (recv_x, recv_x_scales)
+        else:
+            token_data = recv_x
 
-        # record the handle for this ubatch
+        # expert_topk_ids: the original topk_ids offset to local expert space
+        expert_topk_ids = rank_topk_ids
+
+        # expert_topk_weights: pass through
+        expert_topk_weights = rank_topk_weights
+
+        # expert_num_tokens_per_expert_list: how many tokens each local expert
+        # receives.  Compute from topk_ids.
+        expert_num_tokens_per_expert_list = [0] * num_local_experts
+        if num_tokens > 0:
+            flat_ids = rank_topk_ids.view(-1)
+            for eid in range(num_local_experts):
+                global_eid = eid + self.rank_expert_offset
+                expert_num_tokens_per_expert_list[eid] = int(
+                    (flat_ids == global_eid).sum().item()
+                )
+
+        # handle — combine needs it; store a simple tuple with enough info.
+        handle = (num_tokens, hidden, num_topk)
+
+        # Fake event
+        event = _NoopEventOverlap()
+
+        # Record handle for combine
+        from vllm.v1.worker.ubatching import dbo_current_ubatch_id
         a2a_idx = dbo_current_ubatch_id()
         self.handles[a2a_idx] = handle
 
-        dbo_switch_to_compute_sync()
-
         return lambda: self._receiver(
             event,
-            has_scales,
+            recv_x_scales is not None,
             token_data,
             expert_topk_ids,
             num_experts,
@@ -180,7 +182,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
 
     def _receiver(
         self,
-        event: deep_ep.EventOverlap,
+        event: _NoopEventOverlap,
         has_scales: bool,
         token_data: tuple[torch.Tensor, torch.Tensor] | torch.Tensor,
         expert_topk_ids: torch.Tensor | None,
@@ -191,25 +193,11 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         quant_config: FusedMoEQuantConfig,
         defer_input_quant: bool,
     ) -> mk.PrepareResultType:
-        if event.event is not None:
-            event.current_stream_wait()
-
         if has_scales:
-            expert_x, expert_x_scale = token_data
+            expert_x, expert_x_scale = token_data[0], token_data[1]
         else:
             expert_x, expert_x_scale = token_data, None
 
-        # The existing MOE kernels assume that all entries of topk_ids are
-        # valid. To that effect, set the -1s in expert_topk_ids to some expert
-        # outside this rank so the expert_map can remap it to -1 when safe.
-        # With Expert Parallel, the experts are divided amongst the rank
-        # sequentially. For rank 0, set it to num_experts - 1 and for all other
-        # ranks set it to 0 as we know that expert_map will have a -1 in those
-        # regions for those ranks.
-        #
-        # DeepEP's topk_ids output refers to the local experts directly. Offset
-        # the topk_ids to move it back to the global experts space so it aligns
-        # with existing vLLM interfaces.
         assert expert_topk_ids is not None
         expert_topk_ids = torch.where(
             expert_topk_ids == -1,
@@ -217,22 +205,13 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             expert_topk_ids + self.rank_expert_offset,
         )
 
-        # Makes a GPU-CPU copy.
-        # TODO (varun): Maybe it is better to re-compute the expert_num_tokens
-        # on GPU.
         expert_tokens_meta = mk.ExpertTokensMetadata.make_from_list(
             expert_num_tokens_per_expert_list, device=expert_x.device
         )
 
-        # * For non-block quant, dispatch in b16 and quantize now as
-        #   DeepEP kernels only support dispatching block scales.
-        # * For expert kernels that require unquantized inputs,
-        #   defer quantization to FusedMoEExpertsPermuteUnpermute.
         if not quant_config.is_block_quantized and not defer_input_quant:
-            # Quantize after dispatch.
             expert_x_scale = None
             if expert_x.numel() != 0:
-                # TODO: support per_act_token_quant,
                 expert_x, expert_x_scale = moe_kernel_quantize_input(
                     expert_x,
                     a1_scale,
@@ -266,17 +245,11 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
     ) -> mk.ReceiverType:
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
-            # TODO: this only works for topK=1, will need to update for topK>1
             assert topk == 1, (
                 "apply_router_weight_on_input is only implemented for topk=1"
             )
             a1 = a1 * topk_weights.to(a1.dtype)
 
-        # * DeepEP only supports fp8 block scales so quantize
-        #   before the dispatch for these models.
-        # * For all other quantization, dispatch after.
-        # * For expert kernels that require unquantized inputs,
-        #   defer quantization to FusedMoEExpertsPermuteUnpermute.
         if quant_config.is_block_quantized and not defer_input_quant:
             a1q, a1q_scale = moe_kernel_quantize_input(
                 a1,
@@ -320,17 +293,14 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         defer_input_quant: bool = False,
     ) -> mk.PrepareResultType:
         receiver = self.prepare_async(
-            a1,
-            topk_weights,
-            topk_ids,
-            num_experts,
-            expert_map,
-            apply_router_weight_on_input,
-            quant_config,
-            defer_input_quant,
+            a1, topk_weights, topk_ids, num_experts, expert_map,
+            apply_router_weight_on_input, quant_config, defer_input_quant,
         )
         return receiver()
 
+    # ------------------------------------------------------------------
+    # Noop combine — returns expert output directly, no comms
+    # ------------------------------------------------------------------
     def _finalize(
         self,
         output: torch.Tensor,
@@ -341,12 +311,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
         do_async: bool,
     ) -> Callable | None:
-        a2a_idx = dbo_current_ubatch_id()
-        handle = self.handles[a2a_idx]
-        assert handle is not None
-
-        # fused_expert_output can have 0 tokens - This happens when none of the
-        # tokens from the all2all reach this EP rank.
+        # Apply topk weight reduction the same way the real version does.
         if fused_expert_output.numel() != 0:
             if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
                 weight_and_reduce_impl = TopKWeightAndReduceContiguous()
@@ -357,42 +322,22 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
                 topk_ids=topk_ids,
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
-        dbo_yield_and_switch_from_compute_to_comm()
+
+        # Noop combine: the real combine would scatter-reduce across ranks.
+        # In the noop we just copy the reduced expert output to the output
+        # tensor (same as the real code's final step).
         assert fused_expert_output.dtype == torch.bfloat16, (
             f"Expected fused_expert_output bfloat16, got {fused_expert_output.dtype}"
         )
-        previous_event = dbo_get_previous_event(self.buffer.capture)
-        combined_x, _, event = self.buffer.combine(
-            # HT combine only supports BF16
-            x=fused_expert_output,
-            handle=handle,
-            topk_weights=None,
-            config=self._get_combine_config(),
-            previous_event=previous_event,
-            async_finish=do_async and not dbo_enabled(),
-            allocate_on_comm_stream=False,
-        )
-
-        dbo_switch_to_compute()
+        combined_x = fused_expert_output
 
         if do_async:
 
             def _receiver():
-                if event.event is not None:
-                    event.current_stream_wait()
-                dbo_switch_to_comm()
-                # Respect inplace outputs.
                 output.copy_(combined_x, non_blocking=True)
-
-                # TODO(lucas): refactor the modular kernel so this will be
-                # handled there
-                dbo_yield_and_switch_from_comm_to_compute()
 
             return _receiver
         else:
-            # TODO(lucas): support this case with the refactored modular kernel
-            assert not dbo_enabled()
-            # Respect inplace outputs.
             output.copy_(combined_x, non_blocking=True)
             return None
 
@@ -406,13 +351,8 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> Callable:
         receiver = self._finalize(
-            output,
-            fused_expert_output,
-            topk_weights,
-            topk_ids,
-            apply_router_weight_on_input,
-            weight_and_reduce_impl,
-            True,
+            output, fused_expert_output, topk_weights, topk_ids,
+            apply_router_weight_on_input, weight_and_reduce_impl, True,
         )
         assert receiver is not None
         return receiver
@@ -427,11 +367,6 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
         self._finalize(
-            output,
-            fused_expert_output,
-            topk_weights,
-            topk_ids,
-            apply_router_weight_on_input,
-            weight_and_reduce_impl,
-            False,
+            output, fused_expert_output, topk_weights, topk_ids,
+            apply_router_weight_on_input, weight_and_reduce_impl, False,
         )
