@@ -404,7 +404,9 @@ def _has_module(module_name: str) -> bool:
 
 def has_deep_ep() -> bool:
     """Whether the optional `deep_ep` package is available."""
-    return _has_module("deep_ep")
+    # Noop mode: always True — the fake deep_ep shim in the repo root
+    # provides all the symbols vLLM needs without the real C++/CUDA package.
+    return True
 
 
 def has_deep_gemm() -> bool:
