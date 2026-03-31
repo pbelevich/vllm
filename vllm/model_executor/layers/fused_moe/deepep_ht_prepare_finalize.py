@@ -114,7 +114,7 @@ class DeepEPHTPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         num_tokens = tokens.size(0)
         hidden = tokens.size(1)
         num_topk = rank_topk_ids.size(1)
-        num_local_experts = num_experts // self.dp_size
+        num_local_experts = num_experts // self.num_dispatchers_
 
         # ----- Simulate get_dispatch_layout -----
         # In a real run every token goes to num_topk experts.  For the noop
